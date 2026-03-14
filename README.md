@@ -46,12 +46,13 @@ The core goal is simple: **don't make deployment a pain**. The repo ships four d
 
 ```bash
 docker run -d \
-  -p 8888:8888 \
-  -e QB_URL=http://your-qbit:8080 \
+  -p 8888:8080 \
+  -e TORRENTMIX_DB_KEY='replace-with-a-long-random-string' \
+  -v torrentmix-catalog:/config \
   yunfeng86/torrentmix-webui
 ```
 
-See [deploy/standalone-service/README.md](deploy/standalone-service/README.md) for full options.
+Then open `http://localhost:8888` and add your first backend in **Switch Server → Manage Servers**. See [deploy/standalone-service/README.md](deploy/standalone-service/README.md) for full options.
 
 ## Deployment
 
@@ -85,7 +86,7 @@ Priority: URL params (`?ver`) > browser pin (`localStorage`) > `config.json`.
 
 ### B. Standalone
 
-The WebUI static files and reverse-proxy gateway share the same origin, eliminating CORS issues. Supports managing multiple backend instances.
+The WebUI static files and reverse-proxy gateway share the same origin, eliminating CORS issues. Supports managing multiple backend instances and stores the runtime catalog in an encrypted SQLCipher database.
 
 - Docker: [deploy/standalone-service/](deploy/standalone-service/)
 - Binary: [rust/apps/standalone-service/](rust/apps/standalone-service/)

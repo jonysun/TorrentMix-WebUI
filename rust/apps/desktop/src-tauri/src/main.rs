@@ -1,7 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
-  fs,
   net::{IpAddr, Ipv4Addr, SocketAddr},
   path::PathBuf,
   time::Duration,
@@ -11,20 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tracing_subscriber::{fmt, EnvFilter};
 
-const DEFAULT_CONFIG_JSON: &str = r#"{
-  "defaultServerId": "local-qb",
-  "servers": [
-    {
-      "id": "local-qb",
-      "name": "Local qBittorrent",
-      "type": "qbit",
-      "baseUrl": "http://127.0.0.1:8080",
-      "username": "admin",
-      "password": "adminadmin"
-    }
-  ]
-}
-"#;
+const ENV_CATALOG_DB: &str = "STANDALONE_DB";
 
 fn main() {
   let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -33,15 +19,14 @@ fn main() {
   tauri::Builder::default()
     .setup(|app| {
       let static_dir = resolve_static_dir()?;
-      let config_path = resolve_config_path(app)?;
-      ensure_config_file(&config_path)?;
+      let catalog_db_path = resolve_catalog_db_path(app)?;
 
       let addr = tauri::async_runtime::block_on(async move {
         let listen = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         let listener = tokio::net::TcpListener::bind(listen)
           .await
           .context("bind gateway listener")?;
-        let addr = gateway::spawn_with_listener(listener, static_dir, config_path)
+        let addr = gateway::spawn_with_listener(listener, static_dir, catalog_db_path)
           .await
           .context("start gateway")?;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -63,10 +48,10 @@ fn main() {
 }
 
 fn resolve_static_dir() -> Result<PathBuf> {
-  if let Ok(v) = std::env::var("STATIC_DIR") {
-    let v = v.trim();
-    if !v.is_empty() {
-      return Ok(PathBuf::from(v));
+  if let Ok(value) = std::env::var("STATIC_DIR") {
+    let value = value.trim();
+    if !value.is_empty() {
+      return Ok(PathBuf::from(value));
     }
   }
 
@@ -89,11 +74,11 @@ fn resolve_static_dir() -> Result<PathBuf> {
   ))
 }
 
-fn resolve_config_path(app: &tauri::App) -> Result<PathBuf> {
-  if let Ok(v) = std::env::var("STANDALONE_CONFIG") {
-    let v = v.trim();
-    if !v.is_empty() {
-      return Ok(PathBuf::from(v));
+fn resolve_catalog_db_path(app: &tauri::App) -> Result<PathBuf> {
+  if let Ok(value) = std::env::var(ENV_CATALOG_DB) {
+    let value = value.trim();
+    if !value.is_empty() {
+      return Ok(PathBuf::from(value));
     }
   }
 
@@ -101,17 +86,5 @@ fn resolve_config_path(app: &tauri::App) -> Result<PathBuf> {
     .path()
     .app_config_dir()
     .context("resolve app config dir")?;
-  Ok(dir.join("standalone.json"))
-}
-
-fn ensure_config_file(path: &PathBuf) -> Result<()> {
-  if path.exists() {
-    return Ok(());
-  }
-  if let Some(parent) = path.parent() {
-    fs::create_dir_all(parent).with_context(|| format!("create dir: {}", parent.display()))?;
-  }
-  fs::write(path, DEFAULT_CONFIG_JSON.as_bytes())
-    .with_context(|| format!("write config: {}", path.display()))?;
-  Ok(())
+  Ok(dir.join("catalog.db"))
 }

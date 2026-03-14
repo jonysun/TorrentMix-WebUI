@@ -1,7 +1,12 @@
+mod catalog;
+mod key;
+mod migrations;
+mod store;
+
 use std::{
   collections::HashMap,
   net::{IpAddr, Ipv4Addr, SocketAddr},
-  path::{Path, PathBuf},
+  path::PathBuf,
   sync::Arc,
   time::Duration,
 };
@@ -30,144 +35,21 @@ use tokio::{
 use tower_http::services::{ServeDir, ServeFile};
 use url::Url;
 
-const COOKIE_SELECTED_SERVER: &str = "tm_server_id";
+use crate::{
+  catalog::{BackendType, Catalog, CatalogConfig, ServerConfig, ServerEntry, COOKIE_SELECTED_SERVER},
+  key::{KeyringOsKeyProvider, MasterKeyResolver, RuntimeFlavor, ENV_MASTER_KEY},
+  store::{CatalogStore, SqlCipherCatalogStore},
+};
+
+const ENV_CATALOG_DB: &str = "STANDALONE_DB";
 const MAX_BODY_BYTES: usize = 64 << 20;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-enum BackendType {
-  Qbit,
-  Trans,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ServerConfig {
-  #[serde(default)]
-  id: String,
-  #[serde(default)]
-  name: String,
-  #[serde(rename = "type")]
-  kind: BackendType,
-  #[serde(default)]
-  base_url: String,
-  #[serde(default)]
-  username: String,
-  #[serde(default)]
-  password: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ConfigFile {
-  #[serde(default)]
-  default_server_id: String,
-  servers: Vec<ServerConfig>,
-}
-
-#[derive(Debug, Clone)]
-struct ServerEntry {
-  cfg: ServerConfig,
-  base: Url,
-  origin: String,
-}
-
-#[derive(Debug)]
-struct Catalog {
-  default_id: String,
-  servers: HashMap<String, ServerEntry>,
-  order: Vec<String>,
-}
-
-impl Catalog {
-  fn load(path: &Path) -> Result<Self> {
-    let raw = std::fs::read(path).with_context(|| format!("read config: {}", path.display()))?;
-    let mut cfg: ConfigFile =
-      serde_json::from_slice(&raw).context("parse config")?;
-
-    if cfg.servers.is_empty() {
-      return Err(anyhow!("config.servers is empty"));
-    }
-
-    cfg.default_server_id = cfg.default_server_id.trim().to_string();
-
-    let mut servers = HashMap::with_capacity(cfg.servers.len());
-    let mut order = Vec::with_capacity(cfg.servers.len());
-
-    for mut s in cfg.servers.drain(..) {
-      s.id = s.id.trim().to_string();
-      s.name = s.name.trim().to_string();
-      s.base_url = s.base_url.trim().to_string();
-      s.username = s.username.trim().to_string();
-      s.password = s.password.trim().to_string();
-
-      if s.id.is_empty() {
-        return Err(anyhow!("server.id is required"));
-      }
-      if s.name.is_empty() {
-        s.name = s.id.clone();
-      }
-      if s.base_url.is_empty() {
-        return Err(anyhow!("server {:?}: baseUrl is required", s.id));
-      }
-      if servers.contains_key(&s.id) {
-        return Err(anyhow!("duplicate server id: {:?}", s.id));
-      }
-
-      let base = Url::parse(&s.base_url)
-        .with_context(|| format!("server {:?}: invalid baseUrl {:?}", s.id, s.base_url))?;
-      if base.scheme().is_empty() || base.host_str().is_none() {
-        return Err(anyhow!("server {:?}: invalid baseUrl {:?}", s.id, s.base_url));
-      }
-
-      let host = base.host_str().unwrap();
-      let host_for_origin = format_host_only(host);
-      let origin = if let Some(port) = base.port() {
-        format!("{}://{}:{}", base.scheme(), host_for_origin, port)
-      } else {
-        format!("{}://{}", base.scheme(), host_for_origin)
-      };
-      let entry = ServerEntry { cfg: s, base, origin };
-      order.push(entry.cfg.id.clone());
-      servers.insert(entry.cfg.id.clone(), entry);
-    }
-
-    let default_id = if cfg.default_server_id.is_empty() {
-      order[0].clone()
-    } else if servers.contains_key(&cfg.default_server_id) {
-      cfg.default_server_id
-    } else {
-      return Err(anyhow!(
-        "defaultServerId {:?} not found in servers",
-        cfg.default_server_id
-      ));
-    };
-
-    Ok(Self { default_id, servers, order })
-  }
-
-  fn selected_id<'a>(&'a self, jar: &'a CookieJar) -> &'a str {
-    if let Some(cookie) = jar.get(COOKIE_SELECTED_SERVER) {
-      let id = cookie.value().trim();
-      if !id.is_empty() && self.servers.contains_key(id) {
-        return id;
-      }
-    }
-    &self.default_id
-  }
-
-  fn pick<'a>(&'a self, jar: &'a CookieJar) -> &'a ServerEntry {
-    let id = self.selected_id(jar);
-    self.servers.get(id).expect("catalog validated")
-  }
-}
 
 #[derive(Clone)]
 struct AppState {
   catalog: Arc<RwLock<Catalog>>,
+  store: Arc<dyn CatalogStore>,
   qbit: Arc<QbitSessions>,
   client: reqwest::Client,
-  config_path: Arc<PathBuf>,
 }
 
 struct QbitSession {
@@ -317,6 +199,7 @@ struct ConfigResponse {
 struct ConfigUpdateRequest {
   #[serde(default)]
   default_server_id: String,
+  #[serde(default)]
   servers: Vec<ConfigUpdateServer>,
 }
 
@@ -337,55 +220,27 @@ struct ConfigUpdateServer {
 pub async fn serve_from_env() -> Result<()> {
   let listen = env_or_default("LISTEN_ADDR", ":8080");
   let static_dir = env_or_default("STATIC_DIR", "./dist");
-  let config_path = env_or_default("STANDALONE_CONFIG", "/config/standalone.json");
+  let catalog_db_path = env_or_default(ENV_CATALOG_DB, "/config/catalog.db");
 
-  serve(&listen, PathBuf::from(static_dir), PathBuf::from(config_path)).await
+  serve(&listen, PathBuf::from(static_dir), PathBuf::from(catalog_db_path)).await
 }
 
 fn env_or_default(key: &str, default: &str) -> String {
-  let Ok(v) = std::env::var(key) else {
+  let Ok(value) = std::env::var(key) else {
     return default.to_string();
   };
-  let v = v.trim();
-  if v.is_empty() {
-    return default.to_string();
+  let value = value.trim();
+  if value.is_empty() {
+    default.to_string()
+  } else {
+    value.to_string()
   }
-  v.to_string()
 }
 
-pub async fn serve(listen: &str, static_dir: PathBuf, config_path: PathBuf) -> Result<()> {
+pub async fn serve(listen: &str, static_dir: PathBuf, catalog_db_path: PathBuf) -> Result<()> {
   let addr = normalize_listen_addr(listen)?;
-
-  let config_path = Arc::new(config_path);
-
-  let catalog = Catalog::load(&config_path)?;
-  let catalog = Arc::new(RwLock::new(catalog));
-
-  let qbit = Arc::new(QbitSessions::new()?);
-  let client = reqwest::Client::builder()
-    .timeout(Duration::from_secs(60))
-    .redirect(Policy::none())
-    .build()
-    .context("build proxy http client")?;
-
-  let state = AppState {
-    catalog,
-    qbit,
-    client,
-    config_path,
-  };
-
-  let index_path = static_dir.join("index.html");
-  let static_service = ServeDir::new(static_dir).fallback(ServeFile::new(index_path));
-
-  let app = Router::new()
-    .route("/__standalone__/status", get(handle_status))
-    .route("/__standalone__/select", post(handle_select))
-    .route("/__standalone__/config", get(handle_config_get).post(handle_config_update))
-    .route("/api/*path", any(handle_proxy))
-    .route("/transmission/*path", any(handle_proxy))
-    .fallback_service(static_service)
-    .with_state(state);
+  let state = build_state(RuntimeFlavor::StandaloneService, catalog_db_path)?;
+  let app = build_router(state, static_dir);
 
   tracing::info!(listen = %addr, "standalone-service listening");
   axum::serve(tokio::net::TcpListener::bind(addr).await?, app.into_make_service())
@@ -396,40 +251,11 @@ pub async fn serve(listen: &str, static_dir: PathBuf, config_path: PathBuf) -> R
 pub async fn spawn_with_listener(
   listener: tokio::net::TcpListener,
   static_dir: PathBuf,
-  config_path: PathBuf,
+  catalog_db_path: PathBuf,
 ) -> Result<SocketAddr> {
   let addr = listener.local_addr().context("listener local_addr")?;
-
-  let config_path = Arc::new(config_path);
-
-  let catalog = Catalog::load(&config_path)?;
-  let catalog = Arc::new(RwLock::new(catalog));
-
-  let qbit = Arc::new(QbitSessions::new()?);
-  let client = reqwest::Client::builder()
-    .timeout(Duration::from_secs(60))
-    .redirect(Policy::none())
-    .build()
-    .context("build proxy http client")?;
-
-  let state = AppState {
-    catalog,
-    qbit,
-    client,
-    config_path,
-  };
-
-  let index_path = static_dir.join("index.html");
-  let static_service = ServeDir::new(static_dir).fallback(ServeFile::new(index_path));
-
-  let app = Router::new()
-    .route("/__standalone__/status", get(handle_status))
-    .route("/__standalone__/select", post(handle_select))
-    .route("/__standalone__/config", get(handle_config_get).post(handle_config_update))
-    .route("/api/*path", any(handle_proxy))
-    .route("/transmission/*path", any(handle_proxy))
-    .fallback_service(static_service)
-    .with_state(state);
+  let state = build_state(RuntimeFlavor::Desktop, catalog_db_path)?;
+  let app = build_router(state, static_dir);
 
   tokio::spawn(async move {
     if let Err(err) = axum::serve(listener, app.into_make_service()).await {
@@ -440,14 +266,82 @@ pub async fn spawn_with_listener(
   Ok(addr)
 }
 
+fn build_state(runtime: RuntimeFlavor, catalog_db_path: PathBuf) -> Result<AppState> {
+  let provider = Arc::new(KeyringOsKeyProvider::default());
+  let resolver = MasterKeyResolver::new(runtime, provider);
+  let resolved_key = resolver
+    .resolve(&catalog_db_path)
+    .with_context(|| format!("resolve catalog database key from {} or OS key", ENV_MASTER_KEY))?;
+  build_state_from_resolved_key(runtime, catalog_db_path, resolved_key)
+}
+
+#[cfg(test)]
+fn build_state_with_provider(
+  runtime: RuntimeFlavor,
+  catalog_db_path: PathBuf,
+  provider: Arc<dyn key::OsKeyProvider>,
+  env_key: Option<String>,
+) -> Result<AppState> {
+  let resolver = MasterKeyResolver::new(runtime, provider);
+  let resolved_key = resolver
+    .resolve_with_env_value(&catalog_db_path, env_key)
+    .with_context(|| format!("resolve catalog database key from {} or OS key", ENV_MASTER_KEY))?;
+  build_state_from_resolved_key(runtime, catalog_db_path, resolved_key)
+}
+
+fn build_state_from_resolved_key(
+  runtime: RuntimeFlavor,
+  catalog_db_path: PathBuf,
+  resolved_key: key::ResolvedMasterKey,
+) -> Result<AppState> {
+  let store = Arc::new(SqlCipherCatalogStore::bootstrap(catalog_db_path, resolved_key).context("bootstrap encrypted catalog store")?)
+    as Arc<dyn CatalogStore>;
+  let catalog = store.load_catalog().context("load catalog from encrypted store")?;
+
+  tracing::info!(
+    runtime = %runtime,
+    catalog_db = %store.database_path().display(),
+    key_source = %store.key_source(),
+    "catalog store ready"
+  );
+
+  let qbit = Arc::new(QbitSessions::new()?);
+  let client = reqwest::Client::builder()
+    .timeout(Duration::from_secs(60))
+    .redirect(Policy::none())
+    .build()
+    .context("build proxy http client")?;
+
+  Ok(AppState {
+    catalog: Arc::new(RwLock::new(catalog)),
+    store,
+    qbit,
+    client,
+  })
+}
+
+fn build_router(state: AppState, static_dir: PathBuf) -> Router {
+  let index_path = static_dir.join("index.html");
+  let static_service = ServeDir::new(static_dir).fallback(ServeFile::new(index_path));
+
+  Router::new()
+    .route("/__standalone__/status", get(handle_status))
+    .route("/__standalone__/select", post(handle_select))
+    .route("/__standalone__/config", get(handle_config_get).post(handle_config_update))
+    .route("/api/*path", any(handle_proxy))
+    .route("/transmission/*path", any(handle_proxy))
+    .fallback_service(static_service)
+    .with_state(state)
+}
+
 fn normalize_listen_addr(raw: &str) -> Result<SocketAddr> {
   let raw = raw.trim();
   if raw.is_empty() {
     return Err(anyhow!("LISTEN_ADDR is empty"));
   }
 
-  if raw.starts_with(':') {
-    let port: u16 = raw[1..]
+  if let Some(port) = raw.strip_prefix(':') {
+    let port: u16 = port
       .parse()
       .with_context(|| format!("invalid port in LISTEN_ADDR {:?}", raw))?;
     return Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port));
@@ -458,15 +352,12 @@ fn normalize_listen_addr(raw: &str) -> Result<SocketAddr> {
     .with_context(|| format!("invalid LISTEN_ADDR {:?}", raw))
 }
 
-async fn handle_status(
-  State(state): State<AppState>,
-  jar: CookieJar,
-) -> impl IntoResponse {
+async fn handle_status(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
   let (selected, items) = {
     let catalog = state.catalog.read().await;
-    let selected = catalog.selected_id(&jar).to_string();
+    let selected = catalog.selected_id(&jar).unwrap_or("").to_string();
     let mut items = Vec::with_capacity(catalog.order.len());
-    for id in catalog.order.iter() {
+    for id in &catalog.order {
       let entry = catalog.servers.get(id).expect("catalog validated");
       items.push((
         entry.cfg.id.clone(),
@@ -481,7 +372,7 @@ async fn handle_status(
   let deadline = Instant::now() + Duration::from_millis(1200);
 
   let mut tasks = Vec::with_capacity(items.len());
-  for (id, _name, _kind, _base_url, base) in items.iter() {
+  for (id, _name, _kind, _base_url, base) in &items {
     let id = id.clone();
     let base = base.clone();
     tasks.push(async move {
@@ -498,10 +389,7 @@ async fn handle_status(
 
   let mut servers = Vec::with_capacity(items.len());
   for (id, name, kind, base_url, _base) in items {
-    let (latency_ms, reachable) = lat_map
-      .get(&id)
-      .cloned()
-      .unwrap_or((None, false));
+    let (latency_ms, reachable) = lat_map.get(&id).cloned().unwrap_or((None, false));
     servers.push(ServerPublic {
       id,
       name,
@@ -524,26 +412,19 @@ async fn handle_status(
   )
 }
 
-async fn handle_select(
-  State(state): State<AppState>,
-  req: Request<Body>,
-) -> Response {
+async fn handle_select(State(state): State<AppState>, req: Request<Body>) -> Response {
   if req.method() != Method::POST {
     return (StatusCode::METHOD_NOT_ALLOWED, "method not allowed").into_response();
   }
 
   let body = match read_body_bytes(req.into_body(), 1024).await {
-    Ok(v) => v,
-    Err(_) => {
-      return (StatusCode::BAD_REQUEST, "invalid json body").into_response();
-    }
+    Ok(value) => value,
+    Err(_) => return (StatusCode::BAD_REQUEST, "invalid json body").into_response(),
   };
 
   let parsed: SelectRequest = match serde_json::from_slice(&body) {
-    Ok(v) => v,
-    Err(_) => {
-      return (StatusCode::BAD_REQUEST, "invalid json body").into_response();
-    }
+    Ok(value) => value,
+    Err(_) => return (StatusCode::BAD_REQUEST, "invalid json body").into_response(),
   };
 
   let id = parsed.id.trim().to_string();
@@ -560,11 +441,11 @@ async fn handle_select(
   let cookie = format!(
     "{name}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000",
     name = COOKIE_SELECTED_SERVER,
-    value = id
+    value = id,
   );
   let mut headers = HeaderMap::new();
-  if let Ok(v) = header::HeaderValue::from_str(&cookie) {
-    headers.insert(header::SET_COOKIE, v);
+  if let Ok(value) = header::HeaderValue::from_str(&cookie) {
+    headers.insert(header::SET_COOKIE, value);
   }
 
   let out = serde_json::json!({ "ok": true, "id": id });
@@ -578,7 +459,12 @@ async fn handle_proxy(
 ) -> Response {
   let entry = {
     let catalog = state.catalog.read().await;
-    catalog.pick(&jar).clone()
+    match catalog.pick(&jar) {
+      Some(entry) => entry.clone(),
+      None => {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no server configured").into_response();
+      }
+    }
   };
 
   let method = req.method().clone();
@@ -586,19 +472,17 @@ async fn handle_proxy(
   let headers = req.headers().clone();
 
   let body = match read_body_bytes(req.into_body(), MAX_BODY_BYTES).await {
-    Ok(v) => v,
+    Ok(value) => value,
     Err(ReadBodyError::TooLarge) => {
       return (StatusCode::PAYLOAD_TOO_LARGE, "request entity too large").into_response();
     }
-    Err(_) => {
-      return (StatusCode::BAD_REQUEST, "read body failed").into_response();
-    }
+    Err(_) => return (StatusCode::BAD_REQUEST, "read body failed").into_response(),
   };
 
   let mut cookie: Option<String> = None;
   if entry.cfg.kind == BackendType::Qbit {
-    if let Ok(v) = state.qbit.ensure_cookie(&entry, false).await {
-      cookie = Some(v);
+    if let Ok(value) = state.qbit.ensure_cookie(&entry, false).await {
+      cookie = Some(value);
     }
   }
 
@@ -613,15 +497,13 @@ async fn handle_proxy(
   )
   .await
   {
-    Ok(v) => v,
-    Err(err) => {
-      return (StatusCode::BAD_GATEWAY, err.to_string()).into_response();
-    }
+    Ok(value) => value,
+    Err(err) => return (StatusCode::BAD_GATEWAY, err.to_string()).into_response(),
   };
 
   if entry.cfg.kind == BackendType::Qbit && resp.status() == StatusCode::FORBIDDEN {
-    if let Ok(v) = state.qbit.ensure_cookie(&entry, true).await {
-      cookie = Some(v);
+    if let Ok(value) = state.qbit.ensure_cookie(&entry, true).await {
+      cookie = Some(value);
     }
     resp = match forward_once(
       &state,
@@ -634,16 +516,13 @@ async fn handle_proxy(
     )
     .await
     {
-      Ok(v) => v,
-      Err(err) => {
-        return (StatusCode::BAD_GATEWAY, err.to_string()).into_response();
-      }
+      Ok(value) => value,
+      Err(err) => return (StatusCode::BAD_GATEWAY, err.to_string()).into_response(),
     };
   }
 
   let status = resp.status();
   let mut out_headers = sanitize_response_headers(resp.headers().clone());
-
   let stream = resp
     .bytes_stream()
     .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err));
@@ -660,7 +539,7 @@ async fn handle_config_get(State(state): State<AppState>) -> impl IntoResponse {
     let catalog = state.catalog.read().await;
     let default_server_id = catalog.default_id.clone();
     let mut servers = Vec::with_capacity(catalog.order.len());
-    for id in catalog.order.iter() {
+    for id in &catalog.order {
       let entry = catalog.servers.get(id).expect("catalog validated");
       servers.push(ConfigServerPublic {
         id: entry.cfg.id.clone(),
@@ -695,20 +574,16 @@ async fn handle_config_update(
   }
 
   let body = match read_body_bytes(req.into_body(), 64 * 1024).await {
-    Ok(v) => v,
+    Ok(value) => value,
     Err(ReadBodyError::TooLarge) => {
       return (StatusCode::PAYLOAD_TOO_LARGE, "request entity too large").into_response();
     }
-    Err(_) => {
-      return (StatusCode::BAD_REQUEST, "read body failed").into_response();
-    }
+    Err(_) => return (StatusCode::BAD_REQUEST, "read body failed").into_response(),
   };
 
   let parsed: ConfigUpdateRequest = match serde_json::from_slice(&body) {
-    Ok(v) => v,
-    Err(_) => {
-      return (StatusCode::BAD_REQUEST, "invalid json body").into_response();
-    }
+    Ok(value) => value,
+    Err(_) => return (StatusCode::BAD_REQUEST, "invalid json body").into_response(),
   };
 
   let existing_passwords = {
@@ -723,8 +598,8 @@ async fn handle_config_update(
   let mut servers = Vec::with_capacity(parsed.servers.len());
   let mut seen_ids = HashMap::<String, ()>::with_capacity(parsed.servers.len());
 
-  for s in parsed.servers {
-    let id = s.id.trim().to_string();
+  for server in parsed.servers {
+    let id = server.id.trim().to_string();
     if id.is_empty() {
       return (StatusCode::BAD_REQUEST, "server.id is required").into_response();
     }
@@ -732,91 +607,63 @@ async fn handle_config_update(
       return (StatusCode::BAD_REQUEST, "duplicate server id").into_response();
     }
 
-    let mut name = s.name.trim().to_string();
+    let mut name = server.name.trim().to_string();
     if name.is_empty() {
       name = id.clone();
     }
-    let base_url = s.base_url.trim().to_string();
+
+    let base_url = server.base_url.trim().to_string();
     if base_url.is_empty() {
       return (StatusCode::BAD_REQUEST, "server.baseUrl is required").into_response();
     }
-
-    if let Ok(base) = Url::parse(&base_url) {
-      if base.scheme().is_empty() || base.host_str().is_none() {
-        return (StatusCode::BAD_REQUEST, "server.baseUrl is invalid").into_response();
-      }
-    } else {
-      return (StatusCode::BAD_REQUEST, "server.baseUrl is invalid").into_response();
+    match Url::parse(&base_url) {
+      Ok(base) if !base.scheme().is_empty() && base.host_str().is_some() => {}
+      _ => return (StatusCode::BAD_REQUEST, "server.baseUrl is invalid").into_response(),
     }
 
-    let username = s.username.trim().to_string();
-    let password = s
+    let username = server.username.trim().to_string();
+    let password = server
       .password
-      .map(|v| v.trim().to_string())
+      .map(|value| value.trim().to_string())
       .unwrap_or_else(|| existing_passwords.get(&id).cloned().unwrap_or_default());
 
-    if s.kind == BackendType::Qbit && username.is_empty() && password.is_empty() {
-      return (StatusCode::BAD_REQUEST, "qBittorrent server requires username/password").into_response();
+    if server.kind == BackendType::Qbit && username.is_empty() && password.is_empty() {
+      return (StatusCode::BAD_REQUEST, "qBittorrent server requires username/password")
+        .into_response();
     }
 
     servers.push(ServerConfig {
       id,
       name,
-      kind: s.kind,
+      kind: server.kind,
       base_url,
       username,
       password,
     });
   }
 
-  if servers.is_empty() {
-    return (StatusCode::BAD_REQUEST, "servers is empty").into_response();
-  }
-
   let mut default_server_id = parsed.default_server_id.trim().to_string();
   if default_server_id.is_empty() {
-    default_server_id = servers[0].id.clone();
-  } else if !servers.iter().any(|s| s.id == default_server_id) {
+    default_server_id = servers.first().map(|server| server.id.clone()).unwrap_or_default();
+  } else if !servers.iter().any(|server| server.id == default_server_id) {
     return (StatusCode::BAD_REQUEST, "defaultServerId not found in servers").into_response();
   }
 
-  let config = ConfigFile {
+  let config = CatalogConfig {
     default_server_id,
     servers,
   };
 
-  let raw = match serde_json::to_vec_pretty(&config) {
-    Ok(v) => v,
-    Err(_) => {
-      return (StatusCode::INTERNAL_SERVER_ERROR, "serialize config failed").into_response();
-    }
-  };
-
-  if let Some(parent) = state.config_path.parent() {
-    if let Err(err) = tokio::fs::create_dir_all(parent).await {
-      tracing::error!(error = %err, "create config dir failed");
-    }
-  }
-
-  let tmp = state.config_path.with_extension("tmp");
-  if let Err(err) = tokio::fs::write(&tmp, &raw).await {
-    tracing::error!(error = %err, "write config tmp failed");
+  if let Err(err) = state.store.save_config(config) {
+    tracing::error!(error = %err, "save catalog config failed");
     return (StatusCode::INTERNAL_SERVER_ERROR, "write config failed").into_response();
   }
 
-  if let Err(err) = tokio::fs::rename(&tmp, &*state.config_path).await {
-    let _ = tokio::fs::remove_file(&*state.config_path).await;
-    if let Err(err2) = tokio::fs::rename(&tmp, &*state.config_path).await {
-      tracing::error!(error = %err, error2 = %err2, "rename config failed");
-      return (StatusCode::INTERNAL_SERVER_ERROR, "write config failed").into_response();
-    }
-  }
-
-  let new_catalog = match Catalog::load(&state.config_path) {
-    Ok(v) => v,
+  let new_catalog = match state.store.load_catalog() {
+    Ok(value) => value,
     Err(err) => {
       tracing::error!(error = %err, "reload catalog failed");
-      return (StatusCode::BAD_REQUEST, "config is invalid").into_response();
+      return (StatusCode::INTERNAL_SERVER_ERROR, "reload config failed").into_response();
     }
   };
 
@@ -842,13 +689,13 @@ async fn forward_once(
   let mut out_headers = sanitize_request_headers(headers.clone());
 
   if entry.cfg.kind == BackendType::Qbit {
-    out_headers.insert("origin", header::HeaderValue::from_str(&entry.origin)?);
+    out_headers.insert("origin", HeaderValue::from_str(&entry.origin)?);
     out_headers.insert(
       "referer",
-      header::HeaderValue::from_str(&format!("{}/", entry.origin))?,
+      HeaderValue::from_str(&format!("{}/", entry.origin))?,
     );
-    if let Some(v) = qbit_cookie {
-      out_headers.insert("cookie", header::HeaderValue::from_str(v)?);
+    if let Some(value) = qbit_cookie {
+      out_headers.insert("cookie", HeaderValue::from_str(value)?);
     }
   }
 
@@ -879,16 +726,16 @@ fn build_target_url(base: &Url, uri: &Uri) -> Result<Url> {
 }
 
 fn join_path(a: &str, b: &str) -> String {
-  let aslash = a.ends_with('/');
-  let bslash = b.starts_with('/');
+  let a_slash = a.ends_with('/');
+  let b_slash = b.starts_with('/');
 
-  match (aslash, bslash) {
+  match (a_slash, b_slash) {
     (true, true) => format!("{}{}", a, b.trim_start_matches('/')),
     (false, false) => {
       if a.is_empty() {
-        format!("/{}", b)
+        format!("/{b}")
       } else {
-        format!("{}/{}", a, b)
+        format!("{a}/{b}")
       }
     }
     _ => format!("{a}{b}"),
@@ -931,14 +778,6 @@ fn format_host_port(host: &str, port: u16) -> String {
   }
 }
 
-fn format_host_only(host: &str) -> String {
-  if host.contains(':') && !host.starts_with('[') {
-    format!("[{host}]")
-  } else {
-    host.to_string()
-  }
-}
-
 fn extract_set_cookie_pairs(headers: &HeaderMap) -> Vec<String> {
   let mut out = Vec::new();
   for value in headers.get_all(header::SET_COOKIE).iter() {
@@ -978,12 +817,12 @@ fn sanitize_response_headers(mut headers: HeaderMap) -> HeaderMap {
 }
 
 fn remove_hop_headers(headers: &mut HeaderMap) {
-  let conn = headers
+  let connection = headers
     .get(header::CONNECTION)
-    .and_then(|v| v.to_str().ok())
-    .map(|v| v.to_string());
-  if let Some(conn) = conn {
-    for token in conn.split(',') {
+    .and_then(|value| value.to_str().ok())
+    .map(|value| value.to_string());
+  if let Some(connection) = connection {
+    for token in connection.split(',') {
       let name = token.trim().to_ascii_lowercase();
       if let Ok(name) = HeaderName::from_bytes(name.as_bytes()) {
         headers.remove(name);
@@ -1019,7 +858,7 @@ async fn read_body_bytes(body: Body, limit: usize) -> std::result::Result<Vec<u8
 
   while let Some(next) = stream.next().await {
     let chunk = match next {
-      Ok(v) => v,
+      Ok(value) => value,
       Err(_) => return Err(ReadBodyError::Other),
     };
 
@@ -1031,4 +870,210 @@ async fn read_body_bytes(body: Body, limit: usize) -> std::result::Result<Vec<u8
   }
 
   Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+  use std::{collections::HashMap, path::Path, sync::{Arc, Mutex}};
+
+  use anyhow::Result;
+  use axum::{body::{to_bytes, Body}, http::{Request, StatusCode}};
+  use tempfile::tempdir;
+  use tower::ServiceExt;
+
+  use crate::{
+    catalog::{BackendType, CatalogConfig, ServerConfig},
+    key::{OsKeyProvider, RuntimeFlavor},
+  };
+
+  use super::{build_router, build_state_with_provider};
+
+  #[derive(Clone, Default)]
+  struct MemoryOsKeyProvider {
+    values: Arc<Mutex<HashMap<String, String>>>,
+  }
+
+  impl OsKeyProvider for MemoryOsKeyProvider {
+    fn read(&self, db_path: &Path) -> Result<Option<String>> {
+      Ok(self
+        .values
+        .lock()
+        .expect("lock")
+        .get(&db_path.display().to_string())
+        .cloned())
+    }
+
+    fn write(&self, db_path: &Path, secret: &str) -> Result<()> {
+      self
+        .values
+        .lock()
+        .expect("lock")
+        .insert(db_path.display().to_string(), secret.to_string());
+      Ok(())
+    }
+  }
+
+  #[tokio::test]
+  async fn config_api_hides_and_preserves_passwords() -> Result<()> {
+    let runtime = tempdir()?;
+    let static_dir = runtime.path().join("dist");
+    std::fs::create_dir_all(&static_dir)?;
+    std::fs::write(static_dir.join("index.html"), "ok")?;
+
+    let db_path = runtime.path().join("catalog.db");
+    let provider = Arc::new(MemoryOsKeyProvider::default());
+    let state = build_state_with_provider(
+      RuntimeFlavor::StandaloneService,
+      db_path.clone(),
+      provider,
+      Some("integration-secret".to_string()),
+    )?;
+    let store = state.store.clone();
+    let app = build_router(state, static_dir);
+
+    let create = Request::builder()
+      .method("POST")
+      .uri("/__standalone__/config")
+      .header("content-type", "application/json")
+      .body(Body::from(
+        serde_json::json!({
+          "defaultServerId": "home-qb",
+          "servers": [
+            {
+              "id": "home-qb",
+              "name": "Home qB",
+              "type": "qbit",
+              "baseUrl": "http://127.0.0.1:8080",
+              "username": "admin",
+              "password": "secret-1"
+            }
+          ]
+        })
+        .to_string(),
+      ))?;
+    let create_resp = app.clone().oneshot(create).await?;
+    assert_eq!(create_resp.status(), StatusCode::OK);
+
+    let read = Request::builder()
+      .uri("/__standalone__/config")
+      .body(Body::empty())?;
+    let read_resp = app.clone().oneshot(read).await?;
+    assert_eq!(read_resp.status(), StatusCode::OK);
+    let read_json: serde_json::Value = serde_json::from_slice(&to_bytes(read_resp.into_body(), usize::MAX).await?)?;
+    assert_eq!(read_json["servers"][0]["hasPassword"], serde_json::Value::Bool(true));
+    assert!(read_json["servers"][0].get("password").is_none());
+
+    let keep_existing = Request::builder()
+      .method("POST")
+      .uri("/__standalone__/config")
+      .header("content-type", "application/json")
+      .body(Body::from(
+        serde_json::json!({
+          "defaultServerId": "home-qb",
+          "servers": [
+            {
+              "id": "home-qb",
+              "name": "Home qB Updated",
+              "type": "qbit",
+              "baseUrl": "http://127.0.0.1:8080",
+              "username": "admin"
+            }
+          ]
+        })
+        .to_string(),
+      ))?;
+    let keep_resp = app.clone().oneshot(keep_existing).await?;
+    assert_eq!(keep_resp.status(), StatusCode::OK);
+    let config_after_keep = store.load_config()?;
+    assert_eq!(config_after_keep.servers[0].password, "secret-1");
+    assert_eq!(config_after_keep.servers[0].name, "Home qB Updated");
+
+    let clear_password = Request::builder()
+      .method("POST")
+      .uri("/__standalone__/config")
+      .header("content-type", "application/json")
+      .body(Body::from(
+        serde_json::json!({
+          "defaultServerId": "home-qb",
+          "servers": [
+            {
+              "id": "home-qb",
+              "name": "Home qB Updated",
+              "type": "qbit",
+              "baseUrl": "http://127.0.0.1:8080",
+              "username": "admin",
+              "password": ""
+            }
+          ]
+        })
+        .to_string(),
+      ))?;
+    let clear_resp = app.clone().oneshot(clear_password).await?;
+    assert_eq!(clear_resp.status(), StatusCode::OK);
+    let config_after_clear = store.load_config()?;
+    assert_eq!(config_after_clear.servers[0].password, "");
+
+    let read_after_clear = Request::builder()
+      .uri("/__standalone__/config")
+      .body(Body::empty())?;
+    let read_after_clear_resp = app.oneshot(read_after_clear).await?;
+    let read_after_clear_json: serde_json::Value = serde_json::from_slice(
+      &to_bytes(read_after_clear_resp.into_body(), usize::MAX).await?,
+    )?;
+    assert_eq!(read_after_clear_json["servers"][0]["hasPassword"], serde_json::Value::Bool(false));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn desktop_bootstraps_empty_database_with_os_key() -> Result<()> {
+    let dir = tempdir()?;
+    let static_dir = dir.path().join("dist");
+    std::fs::create_dir_all(&static_dir)?;
+    std::fs::write(static_dir.join("index.html"), "ok")?;
+
+    let db_path = dir.path().join("catalog.db");
+    let provider = Arc::new(MemoryOsKeyProvider::default());
+    let state = build_state_with_provider(RuntimeFlavor::Desktop, db_path.clone(), provider, None)?;
+
+    assert!(db_path.exists());
+    assert!(state.catalog.read().await.order.is_empty());
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn standalone_service_fails_with_wrong_env_key_for_existing_database() -> Result<()> {
+    let dir = tempdir()?;
+    let db_path = dir.path().join("catalog.db");
+    let provider = Arc::new(MemoryOsKeyProvider::default());
+
+    let state = build_state_with_provider(
+      RuntimeFlavor::StandaloneService,
+      db_path.clone(),
+      provider.clone(),
+      Some("good-key".to_string()),
+    )?;
+    state.store.save_config(CatalogConfig {
+      default_server_id: "home-qb".to_string(),
+      servers: vec![ServerConfig {
+        id: "home-qb".to_string(),
+        name: "Home qB".to_string(),
+        kind: BackendType::Qbit,
+        base_url: "http://127.0.0.1:8080".to_string(),
+        username: "admin".to_string(),
+        password: "secret".to_string(),
+      }],
+    })?;
+
+    let err = match build_state_with_provider(
+      RuntimeFlavor::StandaloneService,
+      db_path,
+      provider,
+      Some("wrong-key".to_string()),
+    ) {
+      Ok(_) => panic!("wrong env key should fail startup"),
+      Err(err) => err,
+    };
+    assert!(!err.to_string().trim().is_empty());
+    Ok(())
+  }
 }

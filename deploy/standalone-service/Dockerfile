@@ -10,10 +10,10 @@ COPY . .
 RUN pnpm run build
 
 
-FROM rust:1.78-alpine AS build-server
+FROM rust:1.88-alpine AS build-server
 WORKDIR /src/rust
 
-RUN apk add --no-cache musl-dev
+RUN apk add --no-cache build-base musl-dev perl pkgconf
 
 COPY rust/Cargo.toml rust/Cargo.lock ./
 COPY rust/apps ./apps
@@ -31,7 +31,7 @@ COPY --from=build-server /src/rust/target/release/standalone-service /app/standa
 
 ENV LISTEN_ADDR=:8080
 ENV STATIC_DIR=/app/dist
-ENV STANDALONE_CONFIG=/config/standalone.json
+ENV STANDALONE_DB=/config/catalog.db
 
 EXPOSE 8080
 ENTRYPOINT ["/app/standalone-service"]

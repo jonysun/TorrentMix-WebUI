@@ -46,12 +46,13 @@
 
 ```bash
 docker run -d \
-  -p 8888:8888 \
-  -e QB_URL=http://your-qbit:8080 \
+  -p 8888:8080 \
+  -e TORRENTMIX_DB_KEY='replace-with-a-long-random-string' \
+  -v torrentmix-catalog:/config \
   yunfeng86/torrentmix-webui
 ```
 
-详见 [deploy/standalone-service/README.md](deploy/standalone-service/README.md)。
+然后访问 `http://localhost:8888`，通过 **切换服务器 → 管理服务器** 创建第一个后端。详见 [deploy/standalone-service/README.md](deploy/standalone-service/README.md)。
 
 ## 部署方案
 
@@ -85,7 +86,7 @@ docker run -d \
 
 ### B. Standalone — 独立服务
 
-WebUI 静态文件与反代网关共享同源出口，彻底规避 CORS 问题，同时支持多后端实例管理。
+WebUI 静态文件与反代网关共享同源出口，彻底规避 CORS 问题，同时支持多后端实例管理，并将运行时目录保存在加密 SQLCipher 数据库中。
 
 - Docker 部署：[deploy/standalone-service/](deploy/standalone-service/)
 - 二进制部署：[rust/apps/standalone-service/](rust/apps/standalone-service/)

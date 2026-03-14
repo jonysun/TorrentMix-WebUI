@@ -9,22 +9,28 @@ The **Standalone Service** turns the WebUI into a self-contained same-origin gat
 - Serves WebUI static assets
 - Reverse-proxies `/api/*` (qBittorrent) and `/transmission/*` (Transmission) to configured backend instances
 - Provides a server-switcher panel with pre-configured credentials and latency display
-- Supports in-browser server configuration that writes back to the config file
+- Stores the server catalog in an encrypted SQLCipher database and supports in-browser configuration edits
 
 ## Configuration
 
-The service reads from the path in `STANDALONE_CONFIG` (default: `/config/standalone.json`).
+The service stores runtime configuration in an encrypted SQLCipher database at `STANDALONE_DB` (default: `/config/catalog.db`). The database contains the default server selection, server metadata, usernames, and passwords.
 
-See [`config.example.json`](config.example.json) for a full example.
+### Key resolution
 
-| Field | Description |
-|-------|-------------|
-| `defaultServerId` | Server to connect on startup (defaults to the first entry if omitted) |
-| `servers[].id` | Unique identifier |
-| `servers[].name` | Display name |
-| `servers[].type` | `qbit` or `trans` |
-| `servers[].baseUrl` | Backend base URL (e.g. `http://qb:8080`) |
-| `servers[].username` / `.password` | Pre-configured credentials for seamless auth |
+- `TORRENTMIX_DB_KEY` — authoritative master key. If provided, startup uses it directly and fails fast if the database cannot be opened with that key.
+- OS key provider — used only when `TORRENTMIX_DB_KEY` is not set. This can work for non-containerized deployments, but in containers it is usually unavailable.
+- No key source available — startup fails. The service does **not** auto-generate an unmanaged key.
+
+### Environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `LISTEN_ADDR` | Listen address (default `:8080`) |
+| `STATIC_DIR` | Path to frontend static assets (default `/app/dist`) |
+| `STANDALONE_DB` | Path to the encrypted SQLCipher catalog database (default `/config/catalog.db`) |
+| `TORRENTMIX_DB_KEY` | Explicit SQLCipher master key; recommended for Docker, systemd, and CI |
+
+> Legacy `standalone.json` / `config.example.json` are kept only as reference material and are no longer read by the runtime.
 
 ## Docker
 
@@ -34,17 +40,18 @@ See [`config.example.json`](config.example.json) for a full example.
 docker build -t torrentmix-standalone-service -f deploy/standalone-service/Dockerfile .
 ```
 
-**Run** (mount your config file):
+**Run** (recommended: mount `/config` and provide a master key):
 
 ```bash
 docker run --rm -p 8080:8080 \
-  -v "$PWD/deploy/standalone-service/config.example.json:/config/standalone.json:ro" \
+  -e TORRENTMIX_DB_KEY='replace-with-a-long-random-string' \
+  -v torrentmix-catalog:/config \
   torrentmix-standalone-service
 ```
 
-Open `http://localhost:8080`.
+Open `http://localhost:8080`, then add the first backend via **Switch Server → Manage Servers**.
 
-> **In-browser config:** click **Switch Server → Manage Servers** in the top-right corner. Changes are written back to `STANDALONE_CONFIG` and the page reloads. Passwords are never echoed — leave blank to keep the existing value.
+> **In-browser config:** changes are written back to `STANDALONE_DB`. Passwords are never echoed — leave blank to keep the existing value.
 
 ## Binary (Local Build)
 
@@ -53,18 +60,18 @@ Open `http://localhost:8080`.
 cargo build --manifest-path rust/Cargo.toml --release -p standalone-service
 
 # macOS / Linux
-STANDALONE_CONFIG=deploy/standalone-service/config.example.json \
+STANDALONE_DB=/tmp/torrentmix/catalog.db \
+TORRENTMIX_DB_KEY='replace-with-a-long-random-string' \
 LISTEN_ADDR=:8080 \
 ./rust/target/release/standalone-service
 
 # Windows (PowerShell)
-$env:STANDALONE_CONFIG = 'deploy/standalone-service/config.example.json'
+$env:STANDALONE_DB = 'C:\torrentmix\catalog.db'
+$env:TORRENTMIX_DB_KEY = 'replace-with-a-long-random-string'
 $env:LISTEN_ADDR = ':8080'
 .\rust\target\release\standalone-service.exe
 
 # Option 2: build inside Docker (no local Rust required)
-docker run --rm -v "$PWD:/work" -w /work rust:1.78-alpine \
-  sh -lc "apk add --no-cache musl-dev && cargo build --manifest-path rust/Cargo.toml --release -p standalone-service"
+docker run --rm -v "$PWD:/work" -w /work rust:1.88-alpine \
+  sh -lc "apk add --no-cache build-base musl-dev perl pkgconf && cargo build --manifest-path rust/Cargo.toml --release -p standalone-service"
 ```
-
-

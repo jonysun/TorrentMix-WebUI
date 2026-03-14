@@ -9,22 +9,28 @@
 - 托管 WebUI 静态资源
 - 将 `/api/*`（qBittorrent）和 `/transmission/*`（Transmission）反向代理到配置的后端实例
 - 提供服务器切换面板（支持预置凭证、延迟显示）
-- 支持在浏览器内编辑服务器配置并写回配置文件
+- 将服务器目录持久化到加密 SQLCipher 数据库，并支持在浏览器内直接编辑配置
 
 ## 配置
 
-服务读取 `STANDALONE_CONFIG` 环境变量指向的配置文件（默认：`/config/standalone.json`）。
+服务将运行时配置保存在 `STANDALONE_DB` 指向的加密 SQLCipher 数据库中（默认：`/config/catalog.db`）。数据库包含默认服务器选择、服务器元数据、用户名和密码等信息。
 
-完整示例见 [`config.example.json`](config.example.json)。
+### 主密钥解析
 
-| 字段 | 说明 |
+- `TORRENTMIX_DB_KEY` —— authoritative 主密钥。只要显式提供，就直接使用；若无法解锁数据库，启动立即失败。
+- OS Key provider —— 仅在未设置 `TORRENTMIX_DB_KEY` 时尝试使用。适合非容器环境；在容器里通常不可用。
+- 没有可用 key source —— 启动失败。服务端**不会**自动生成无人管理的密钥。
+
+### 环境变量
+
+| 变量 | 说明 |
 |------|------|
-| `defaultServerId` | 启动时默认连接的服务器 ID（省略时取第一个） |
-| `servers[].id` | 唯一标识符 |
-| `servers[].name` | 展示名称 |
-| `servers[].type` | `qbit` 或 `trans` |
-| `servers[].baseUrl` | 后端基础 URL（如 `http://qb:8080`） |
-| `servers[].username` / `.password` | 预置凭证，实现无感认证 |
+| `LISTEN_ADDR` | 监听地址（默认 `:8080`） |
+| `STATIC_DIR` | 前端静态资源目录（默认 `/app/dist`） |
+| `STANDALONE_DB` | 加密 SQLCipher 配置库路径（默认 `/config/catalog.db`） |
+| `TORRENTMIX_DB_KEY` | 显式 SQLCipher 主密钥；Docker、systemd、CI 推荐设置 |
+
+> 旧的 `standalone.json` / `config.example.json` 现在只作为参考材料保留，runtime 不再读取它们。
 
 ## Docker
 
@@ -34,17 +40,18 @@
 docker build -t torrentmix-standalone-service -f deploy/standalone-service/Dockerfile .
 ```
 
-**运行**（挂载配置文件）：
+**运行**（推荐挂载 `/config` 并显式提供主密钥）：
 
 ```bash
 docker run --rm -p 8080:8080 \
-  -v "$PWD/deploy/standalone-service/config.example.json:/config/standalone.json:ro" \
+  -e TORRENTMIX_DB_KEY='replace-with-a-long-random-string' \
+  -v torrentmix-catalog:/config \
   torrentmix-standalone-service
 ```
 
-访问 `http://localhost:8080`。
+访问 `http://localhost:8080` 后，通过 **切换服务器 → 管理服务器** 创建第一个后端。
 
-> **在浏览器内编辑配置：** 点击右上角 **切换服务器 → 管理服务器**。保存后配置写回 `STANDALONE_CONFIG`，页面自动重新探测后端。密码不会回显，留空表示保持原值不变。
+> **在浏览器内编辑配置：** 变更会写回 `STANDALONE_DB`。密码不会回显，留空表示保持原值不变。
 
 ## 二进制（本地构建）
 
@@ -53,18 +60,18 @@ docker run --rm -p 8080:8080 \
 cargo build --manifest-path rust/Cargo.toml --release -p standalone-service
 
 # macOS / Linux
-STANDALONE_CONFIG=deploy/standalone-service/config.example.json \
+STANDALONE_DB=/tmp/torrentmix/catalog.db \
+TORRENTMIX_DB_KEY='replace-with-a-long-random-string' \
 LISTEN_ADDR=:8080 \
 ./rust/target/release/standalone-service
 
 # Windows（PowerShell）
-$env:STANDALONE_CONFIG = 'deploy/standalone-service/config.example.json'
+$env:STANDALONE_DB = 'C:\torrentmix\catalog.db'
+$env:TORRENTMIX_DB_KEY = 'replace-with-a-long-random-string'
 $env:LISTEN_ADDR = ':8080'
 .\rust\target\release\standalone-service.exe
 
 # 方式 2：在 Docker 内构建（无需本地 Rust 环境）
-docker run --rm -v "$PWD:/work" -w /work rust:1.78-alpine \
-  sh -lc "apk add --no-cache musl-dev && cargo build --manifest-path rust/Cargo.toml --release -p standalone-service"
+docker run --rm -v "$PWD:/work" -w /work rust:1.88-alpine \
+  sh -lc "apk add --no-cache build-base musl-dev perl pkgconf && cargo build --manifest-path rust/Cargo.toml --release -p standalone-service"
 ```
-
-

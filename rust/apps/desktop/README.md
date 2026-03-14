@@ -9,6 +9,7 @@ The desktop app bundles the same `gateway` crate as the Standalone Service, bind
 - Serves WebUI static assets (`dist/`) over HTTP
 - Proxies `/api/*` and `/transmission/*` to configured backends
 - Supports the Standalone server-switcher and visual config editor
+- Stores the runtime catalog in an encrypted SQLCipher database without exposing raw credentials to the frontend
 
 ## Development
 
@@ -26,9 +27,18 @@ cargo run --manifest-path rust/Cargo.toml -p torrentmix-desktop
 
 ## Configuration
 
-The app reads and writes `standalone.json` in the OS app-config directory. Override with environment variables if needed:
+The app stores runtime configuration in `catalog.db` under the OS app-config directory by default.
+
+### Default unlock behavior
+
+- `TORRENTMIX_DB_KEY` set → use it directly as the authoritative SQLCipher key.
+- `TORRENTMIX_DB_KEY` unset → try the OS key store.
+- First startup without an existing database and without an explicit key → generate a new database key automatically and store it in the OS key store.
+
+### Environment variables
 
 | Variable | Description |
 |----------|-------------|
-| `STANDALONE_CONFIG` | Path to the config file |
+| `STANDALONE_DB` | Override the encrypted catalog database path |
+| `TORRENTMIX_DB_KEY` | Explicit SQLCipher master key override |
 | `STATIC_DIR` | Path to frontend static assets (defaults to `./dist`) |
