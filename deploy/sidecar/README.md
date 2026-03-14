@@ -4,6 +4,12 @@
 
 A lightweight sidecar that keeps your backend's WebUI directory in sync with the latest release. It periodically fetches `latest.json`, downloads `dist.zip`, verifies the SHA-256 checksum, and extracts it into the target directory.
 
+The target directory is replaced only when the release contract is valid:
+
+- `latest.json` exposes `release.distZip`
+- `release.distZipSha256` matches when provided
+- the extracted archive contains `index.html` at its root
+
 ## Environment Variables
 
 | Variable | Required | Default | Description |
@@ -29,6 +35,8 @@ docker run --rm \
   -v /path/to/webui:/target \
   torrentmix-sidecar
 ```
+
+If checksum validation fails or the archive layout is invalid, Sidecar logs the failure and leaves the existing `/target` contents untouched.
 
 ## Wiring to the Backend
 

@@ -82,6 +82,12 @@ docker run -d \
 
 优先级：URL 参数（`?ver`）> 浏览器固定（`localStorage`）> `config.json`。
 
+发布契约：
+
+- `latest.json` 中的 `release.path`、`release.manifest`、`release.loader` 与 `release.distZip` 均保持相对路径，便于自托管、镜像站和 `gh-pages` 复用同一套发布产物。
+- `Loader` 会先尝试 URL 中显式提供的更新源，再回退到浏览器保存值、`config.json` 和内置默认候选。
+- `manifest.json` 中声明的入口 JS/CSS 会按 manifest 的相对位置解析，并透传 `integrity` 校验信息。
+
 > ⚠️ 此方案本质上是信任远端脚本，仅建议用于自己可控的发布源。
 
 ### B. Standalone — 独立服务
@@ -102,9 +108,17 @@ CHECK_INTERVAL_SEC=3600 \
 node deploy/sidecar/updater.mjs
 ```
 
+Sidecar 约束：
+
+- `LATEST_URL` 指向的 `latest.json` 必须提供 `release.distZip`；若同时提供 `release.distZipSha256`，则会强制校验。
+- 只有当压缩包校验通过且解压根目录直接包含 `index.html` 时，Sidecar 才会替换目标目录。
+- 校验失败或压缩包结构非法时，Sidecar 会保留当前目标目录内容，不会做半覆盖安装。
+
 ### D. Dist — 离线压缩包
 
 从 Releases 下载 `dist.zip`，解压到 qBittorrent / Transmission 的 WebUI 目录，刷新即可。
+
+`dist.zip` 的发布契约保证解压根目录直接包含 `index.html` 与对应资源文件，不需要额外剥离一层包装目录。
 
 > ⚠️ 不支持 `file://` 直接打开（浏览器安全限制），需由后端或反代作为网页提供。
 
@@ -148,12 +162,12 @@ pnpm build:publish
 
 ```
 artifacts/publish/
-├── latest.json              # 版本仲裁（最新版本指向）
+├── latest.json              # 版本仲裁（最新版本指向，内部引用保持相对路径）
 ├── manifest.json            # 文件哈希 + 入口清单
 ├── loader.html              # 智能引导页（稳定 URL）
 └── releases/
     └── <version>/
-        ├── dist.zip         # 离线 Payload 包（含 SHA-256 校验）
+        ├── dist.zip         # 离线 Payload 包（根目录直接可安装，含 SHA-256 校验）
         └── ...
 ```
 
@@ -165,8 +179,9 @@ artifacts/publish/
 
 1. 运行测试 & 构建
 2. 生成多产物发布目录
-3. 创建 GitHub Release 并上传产物
-4. 将 `latest.json` + `releases/<version>/` 同步到 `gh-pages` 分支
+3. 针对 `Loader` / `Sidecar` / `Dist` 共用产物运行分发契约 smoke
+4. 创建 GitHub Release 并上传产物
+5. 将 `latest.json` + `releases/<version>/` 同步到 `gh-pages` 分支
 
 ## 贡献指南
 

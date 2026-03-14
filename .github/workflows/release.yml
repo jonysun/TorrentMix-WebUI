@@ -36,8 +36,8 @@ jobs:
           corepack prepare pnpm@10.30.2 --activate
           pnpm install --frozen-lockfile
 
-      - name: Install zip (Linux)
-        run: sudo apt-get update && sudo apt-get install -y zip
+      - name: Install archive tools (Linux)
+        run: sudo apt-get update && sudo apt-get install -y zip unzip
 
       - name: Test
         run: pnpm test
@@ -47,6 +47,11 @@ jobs:
 
       - name: Build publish artifacts
         run: pnpm run build:publish
+
+      - name: Distribution smoke
+        env:
+          RUN_DISTRIBUTION_SMOKE: '1'
+        run: node --experimental-strip-types --test --import ./tests/register-loader.mjs tests/format.test.ts
 
       - name: Read version
         id: meta

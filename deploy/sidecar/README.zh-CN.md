@@ -4,6 +4,12 @@
 
 轻量级 sidecar 容器，负责将后端的 WebUI 目录与最新发布版本保持同步。定期拉取 `latest.json`，下载 `dist.zip`，校验 SHA-256 后解压到目标目录。
 
+仅当以下发布契约成立时，才会替换目标目录：
+
+- `latest.json` 含有 `release.distZip`
+- 如果存在 `release.distZipSha256`，校验必须通过
+- 解压后的根目录直接包含 `index.html`
+
 ## 环境变量
 
 | 变量 | 必填 | 默认值 | 说明 |
@@ -29,6 +35,8 @@ docker run --rm \
   -v /path/to/webui:/target \
   torrentmix-sidecar
 ```
+
+如果校验失败或压缩包结构非法，Sidecar 会报错并保留当前 `/target` 内容，不会做半覆盖更新。
 
 ## 接入后端
 

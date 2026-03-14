@@ -82,6 +82,12 @@ You can also pin/unpin a version in the Loader page (stored in `localStorage`). 
 
 Priority: URL params (`?ver`) > browser pin (`localStorage`) > `config.json`.
 
+Release contract:
+
+- `release.path`, `release.manifest`, `release.loader`, and `release.distZip` inside `latest.json` stay relative so the same publish output can be reused across self-hosted sources, mirrors, and `gh-pages`.
+- Loader tries an explicit query-supplied source before browser-saved values, `config.json`, and built-in defaults.
+- Entry JS/CSS from `manifest.json` are resolved relative to the manifest URL and keep `integrity` metadata when present.
+
 > ⚠️ This mode inherently trusts the remote script host. Only use it with a release source you control.
 
 ### B. Standalone
@@ -102,9 +108,17 @@ CHECK_INTERVAL_SEC=3600 \
 node deploy/sidecar/updater.mjs
 ```
 
+Sidecar contract:
+
+- `LATEST_URL` must point to a `latest.json` that exposes `release.distZip`; if `release.distZipSha256` is present, Sidecar enforces it.
+- Sidecar only replaces the target directory after checksum verification succeeds and the extracted archive contains `index.html` at the archive root.
+- If verification fails or the archive layout is invalid, the existing target directory is left untouched.
+
 ### D. Dist (Zip)
 
 Download `dist.zip` from Releases, extract it into the qBittorrent or Transmission WebUI directory, and refresh.
+
+The `dist.zip` contract guarantees that `index.html` and its referenced assets live at the archive root, with no extra wrapper directory to strip first.
 
 > ⚠️ Opening via `file://` won't work (browser security restrictions). It must be served by the backend or a reverse proxy.
 
@@ -148,12 +162,12 @@ Outputs to `artifacts/publish/`:
 
 ```
 artifacts/publish/
-├── latest.json              # Version pointer (latest release)
+├── latest.json              # Version pointer (latest release, relative release refs)
 ├── manifest.json            # File hashes + entrypoint
 ├── loader.html              # Auto-updating loader (stable URL)
 └── releases/
     └── <version>/
-        ├── dist.zip         # Offline payload bundle with SHA-256 checksum
+        ├── dist.zip         # Offline payload bundle (direct-install root + SHA-256)
         └── ...
 ```
 
@@ -165,8 +179,9 @@ Push a tag (e.g. `v0.1.0`) to trigger:
 
 1. Run tests & build
 2. Generate multi-artifact release directory
-3. Create GitHub Release and upload artifacts
-4. Sync `latest.json` + `releases/<version>/` to the `gh-pages` branch
+3. Run distribution-contract smoke checks against those artifacts
+4. Create GitHub Release and upload artifacts
+5. Sync `latest.json` + `releases/<version>/` to the `gh-pages` branch
 
 ## Contributing
 

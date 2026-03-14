@@ -2,36 +2,43 @@ import { spawnSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 
-const LATEST_URL = String(process.env.LATEST_URL || '').trim()
-const TARGET_DIR = String(process.env.TARGET_DIR || '/target').trim()
-const CHECK_INTERVAL_SEC = Number.parseInt(String(process.env.CHECK_INTERVAL_SEC || '3600'), 10)
+export const MARKER_FILE = '.webui-version.json'
 
-const MARKER_FILE = '.webui-version.json'
-
-function sleep(ms) {
+export function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-function sha256Hex(buf) {
+export function sha256Hex(buf) {
   return crypto.createHash('sha256').update(buf).digest('hex')
 }
 
-async function fetchJson(url, timeoutMs = 15000) {
+export function createSidecarConfig(env = process.env) {
+  return {
+    latestUrl: String(env.LATEST_URL || '').trim(),
+    targetDir: String(env.TARGET_DIR || '/target').trim(),
+    checkIntervalSec: Number.parseInt(String(env.CHECK_INTERVAL_SEC || '3600'), 10),
+    tmpRoot: String(env.TMP_ROOT || '/tmp/webui-sidecar').trim(),
+    logger: console,
+  }
+}
+
+export async function fetchJson(url, timeoutMs = 15000) {
   const controller = new AbortController()
-  const t = setTimeout(() => controller.abort(), timeoutMs)
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
     const res = await fetch(url, { cache: 'no-store', signal: controller.signal })
     if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`)
     return await res.json()
   } finally {
-    clearTimeout(t)
+    clearTimeout(timer)
   }
 }
 
-async function download(url, outPath, timeoutMs = 60000) {
+export async function download(url, outPath, timeoutMs = 60000) {
   const controller = new AbortController()
-  const t = setTimeout(() => controller.abort(), timeoutMs)
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
     const res = await fetch(url, { cache: 'no-store', signal: controller.signal })
     if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`)
@@ -40,89 +47,50 @@ async function download(url, outPath, timeoutMs = 60000) {
     await fs.writeFile(outPath, buf)
     return buf
   } finally {
-    clearTimeout(t)
+    clearTimeout(timer)
   }
 }
 
-async function ensureDir(dir) {
+export async function ensureDir(dir) {
   await fs.mkdir(dir, { recursive: true })
 }
 
-async function emptyDir(dir) {
+export async function emptyDir(dir) {
   await ensureDir(dir)
   const entries = await fs.readdir(dir)
   await Promise.all(entries.map(name => fs.rm(path.join(dir, name), { recursive: true, force: true })))
 }
 
-async function copyDir(src, dest) {
+export async function copyDir(src, dest) {
   await fs.cp(src, dest, { recursive: true })
 }
 
-function unzip(zipPath, destDir) {
+export function unzip(zipPath, destDir) {
   const res = spawnSync('unzip', ['-q', '-o', zipPath, '-d', destDir], { stdio: 'inherit' })
   if (res.status !== 0) throw new Error('unzip failed')
 }
 
-async function readInstalledMarker() {
+export async function readInstalledMarker(targetDir) {
   try {
-    const raw = await fs.readFile(path.join(TARGET_DIR, MARKER_FILE), 'utf8')
+    const raw = await fs.readFile(path.join(targetDir, MARKER_FILE), 'utf8')
     return JSON.parse(raw)
   } catch {
     return null
   }
 }
 
-async function writeInstalledMarker(marker) {
-  await fs.writeFile(path.join(TARGET_DIR, MARKER_FILE), JSON.stringify(marker, null, 2) + '\n', 'utf8')
+export async function writeInstalledMarker(targetDir, marker) {
+  await fs.writeFile(path.join(targetDir, MARKER_FILE), JSON.stringify(marker, null, 2) + '\n', 'utf8')
 }
 
-function resolveZipUrl(latestUrl, latestJson) {
+export function resolveZipUrl(latestUrl, latestJson) {
   if (latestJson?.release?.distZip) {
     return new URL(String(latestJson.release.distZip), latestUrl).toString()
   }
-  // 兼容：直接给了 publish 目录下的 manifest.json（没有 zip 信息）
   return null
 }
 
-async function installOnce() {
-  if (!LATEST_URL) {
-    throw new Error('LATEST_URL is required (points to latest.json)')
-  }
-
-  console.log(`[sidecar] checking ${LATEST_URL}`)
-  const latest = await fetchJson(LATEST_URL)
-
-  const version = String(latest?.version || 'unknown')
-  const zipUrl = resolveZipUrl(LATEST_URL, latest)
-  const expectedZipSha256 = String(latest?.release?.distZipSha256 || '').trim().toLowerCase()
-
-  if (!zipUrl) {
-    throw new Error('latest.json does not contain release.distZip; cannot sidecar-install')
-  }
-
-  const installed = await readInstalledMarker()
-  if (installed?.version === version && installed?.zipUrl === zipUrl && (!expectedZipSha256 || installed?.zipSha256 === expectedZipSha256)) {
-    console.log(`[sidecar] up-to-date: ${version}`)
-    return
-  }
-
-  console.log(`[sidecar] downloading ${zipUrl}`)
-  const tmpRoot = '/tmp/webui-sidecar'
-  const zipPath = path.join(tmpRoot, 'dist.zip')
-  const extractDir = path.join(tmpRoot, 'extract')
-  await ensureDir(tmpRoot)
-  await fs.rm(extractDir, { recursive: true, force: true })
-
-  const zipBuf = await download(zipUrl, zipPath)
-  const zipSha256 = sha256Hex(zipBuf)
-  if (expectedZipSha256 && zipSha256 !== expectedZipSha256) {
-    throw new Error(`zip sha256 mismatch: expected=${expectedZipSha256}, got=${zipSha256}`)
-  }
-
-  console.log('[sidecar] extracting…')
-  unzip(zipPath, extractDir)
-
-  // 解压后的结构：根目录应包含 index.html
+export async function validateExtractedWebuiRoot(extractDir) {
   const indexPath = path.join(extractDir, 'index.html')
   let indexStat
   try {
@@ -133,26 +101,87 @@ async function installOnce() {
   if (!indexStat.isFile()) {
     throw new Error('invalid zip: index.html is not a file')
   }
+}
 
-  console.log(`[sidecar] installing to ${TARGET_DIR}`)
-  await emptyDir(TARGET_DIR)
-  await copyDir(extractDir, TARGET_DIR)
+export async function installOnce(config = createSidecarConfig(), overrides = {}) {
+  const {
+    latestUrl,
+    targetDir,
+    tmpRoot,
+    logger = console,
+  } = config
 
-  await writeInstalledMarker({
+  const deps = {
+    fetchJson,
+    download,
+    ensureDir,
+    emptyDir,
+    copyDir,
+    unzip,
+    now: () => new Date(),
+    ...overrides,
+  }
+
+  if (!latestUrl) {
+    throw new Error('LATEST_URL is required (points to latest.json)')
+  }
+
+  logger.log(`[sidecar] checking ${latestUrl}`)
+  const latest = await deps.fetchJson(latestUrl)
+  const version = String(latest?.version || 'unknown')
+  const zipUrl = resolveZipUrl(latestUrl, latest)
+  const expectedZipSha256 = String(latest?.release?.distZipSha256 || '').trim().toLowerCase()
+
+  if (!zipUrl) {
+    throw new Error('latest.json does not contain release.distZip; cannot sidecar-install')
+  }
+
+  const installed = await readInstalledMarker(targetDir)
+  if (
+    installed?.version === version &&
+    installed?.zipUrl === zipUrl &&
+    (!expectedZipSha256 || installed?.zipSha256 === expectedZipSha256)
+  ) {
+    logger.log(`[sidecar] up-to-date: ${version}`)
+    return { status: 'up-to-date', version, zipUrl }
+  }
+
+  logger.log(`[sidecar] downloading ${zipUrl}`)
+  const zipPath = path.join(tmpRoot, 'dist.zip')
+  const extractDir = path.join(tmpRoot, 'extract')
+  await deps.ensureDir(tmpRoot)
+  await fs.rm(extractDir, { recursive: true, force: true })
+
+  const zipBuf = await deps.download(zipUrl, zipPath)
+  const zipSha256 = sha256Hex(zipBuf)
+  if (expectedZipSha256 && zipSha256 !== expectedZipSha256) {
+    throw new Error(`zip sha256 mismatch: expected=${expectedZipSha256}, got=${zipSha256}`)
+  }
+
+  logger.log('[sidecar] extracting…')
+  await Promise.resolve(deps.unzip(zipPath, extractDir))
+  await validateExtractedWebuiRoot(extractDir)
+
+  logger.log(`[sidecar] installing to ${targetDir}`)
+  await deps.emptyDir(targetDir)
+  await deps.copyDir(extractDir, targetDir)
+  await writeInstalledMarker(targetDir, {
     version,
     zipUrl,
     zipSha256,
-    installedAt: new Date().toISOString(),
+    installedAt: deps.now().toISOString(),
   })
 
-  console.log(`[sidecar] installed: ${version}`)
+  logger.log(`[sidecar] installed: ${version}`)
+  return { status: 'installed', version, zipUrl, zipSha256 }
 }
 
-async function main() {
-  await ensureDir(TARGET_DIR)
+export async function main(config = createSidecarConfig()) {
+  const { targetDir, checkIntervalSec, logger = console } = config
+  await ensureDir(targetDir)
 
-  if (!Number.isFinite(CHECK_INTERVAL_SEC) || CHECK_INTERVAL_SEC <= 0) {
-    await installOnce()
+  if (!Number.isFinite(checkIntervalSec) || checkIntervalSec <= 0) {
+    await installOnce(config)
     return
   }
 
@@ -160,21 +189,29 @@ async function main() {
   const stop = (signal) => {
     if (stopped) return
     stopped = true
-    console.log(`[sidecar] ${signal} received, stopping…`)
+    logger.log(`[sidecar] ${signal} received, stopping…`)
   }
+
   process.on('SIGTERM', () => stop('SIGTERM'))
   process.on('SIGINT', () => stop('SIGINT'))
 
   while (!stopped) {
     try {
-      await installOnce()
+      await installOnce(config)
     } catch (err) {
-      console.error('[sidecar] update failed:', err?.stack || err?.message || err)
+      logger.error('[sidecar] update failed:', err?.stack || err?.message || err)
     }
 
     if (stopped) break
-    await sleep(CHECK_INTERVAL_SEC * 1000)
+    await sleep(checkIntervalSec * 1000)
   }
 }
 
-await main()
+function isDirectExecution(metaUrl) {
+  if (!process.argv[1]) return false
+  return metaUrl === pathToFileURL(path.resolve(process.argv[1])).href
+}
+
+if (isDirectExecution(import.meta.url)) {
+  await main()
+}
