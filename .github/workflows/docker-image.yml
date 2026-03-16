@@ -18,5 +18,8 @@ jobs:
       - name: Build image
         uses: docker/build-push-action@v6
         with:
-          context: ./deploy/standalone
+          context: .
+          file: ./deploy/standalone-service/Dockerfile
           push: false
+          tags: jonysun/torrentmix-webui:latest
+
