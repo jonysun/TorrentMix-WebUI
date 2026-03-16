@@ -27,6 +27,6 @@ jobs:
         with:
           context: .
           file: ./deploy/standalone-service/Dockerfile
-          push: false
+          push: true
           tags: jonysun/torrentmix-webui:latest
 
